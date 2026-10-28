@@ -220,6 +220,7 @@ def generate(cfg: MessyConfig, options: GenerationOptions | None = None) -> Gene
     }
 
     joins = {t.input_prefix: t.join for t in cfg.event_tables if t.join is not None}
+    derived = {t.input_prefix: dict(t.cols) for t in cfg.event_tables}
     frames: dict[str, pl.DataFrame] = {}
     truncated: dict[str, int] = {}
     conflicts: dict[AssembledTimestamp, int] = {}
@@ -227,7 +228,9 @@ def generate(cfg: MessyConfig, options: GenerationOptions | None = None) -> Gene
         frame = _generate_table(table, plan, pools, timelines, subject_ids, options, truncated, conflicts)
         join = joins.get(table.prefix)
         if join is not None and join.input_prefix in frames:
-            frame = _adopt_join_keys(frame, table, join, frames[join.input_prefix], options)
+            frame, frames[join.input_prefix] = _adopt_join_keys(
+                frame, table, join, frames[join.input_prefix], options, derived.get(table.prefix, {})
+            )
         frames[table.prefix] = frame
     return GeneratedDataset(
         plan=plan,
@@ -315,7 +318,8 @@ def _adopt_join_keys(
     join,
     target: pl.DataFrame,
     options: GenerationOptions,
-) -> pl.DataFrame:
+    derived: dict | None = None,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Replace a table's join-key columns with real key tuples drawn from the target's frame.
 
     Generating the two sides independently is not good enough for a composite key: each column
@@ -327,29 +331,84 @@ def _adopt_join_keys(
     universe, and overwriting it would break the round-robin assignment that gives every subject a
     row — and, in a subject-level table, would put two rows on one subject.
 
+    A left key may be a ``_table.cols`` entry instead of a raw column:
+
+    - a literal (``_ref_table: "'Pharma'"``) restricts the tuples to target rows holding it;
+    - an expression over one raw column (``_ref_id: $pharmaid::int64``) adopts into that column, and
+      the target key is cast to the expression's dtype, since polars refuses to join mismatched key
+      dtypes. A target key of opaque tokens becomes row numbers first, so it stays unique.
+
     Args:
         frame: The freshly generated frame.
         table: Its plan.
         join: The table's join config.
         target: The already-generated frame of the join target.
         options: The generation options, for the seed.
+        derived: The table's ``_table.cols`` nodes, by name.
 
     Returns:
-        The frame with its join keys adopted from the target.
+        The frame with its join keys adopted from the target, and the target with its key dtypes
+        aligned to the left keys.
+
+    Examples:
+        >>> from MEDS_extract.config import MessyConfig
+        >>> cfg = MessyConfig.parse({"labs": {
+        ...     "_defaults": {"subject_id": "$pid"},
+        ...     "_table": {
+        ...         "cols": {"_ref_id": "$itemid::int64", "_ref_table": "'Lab'"},
+        ...         "join": {"items": {"left_on": ["_ref_id", "_ref_table"],
+        ...                            "right_on": ["id", "source"], "cols": ["name"]}},
+        ...     },
+        ...     "lab": {"code": "$name", "time": None},
+        ... }})
+        >>> table_cfg = cfg.event_tables[0]
+        >>> plan = build_plan(cfg)
+        >>> labs = pl.DataFrame({"pid": [1, 2, 3], "itemid": [0.5, 1.5, 2.5]})
+        >>> items = pl.DataFrame({"id": ["T0", "T1", "T2"], "source": ["Lab", "Other", "Lab"]})
+        >>> labs, items = _adopt_join_keys(
+        ...     labs, plan.table("labs"), table_cfg.join, items, GenerationOptions(), dict(table_cfg.cols)
+        ... )
+        >>> items["id"].to_list(), items["id"].dtype
+        ([1, 2, 3], Int64)
+        >>> sorted(set(labs["itemid"].to_list()))
+        [1, 3]
     """
-    pairs = [
-        (left, right)
-        for left, right in zip(join.left_on, join.right_on, strict=True)
-        if left != table.subject_column and left in frame.columns and right in target.columns
-    ]
-    if not pairs or target.height == 0:
-        return frame
+    derived = derived or {}
+    pairs: list[tuple[str, str]] = []
+    literals: list[tuple[str, object]] = []
+    for left, right in zip(join.left_on, join.right_on, strict=True):
+        if right not in target.columns:
+            continue
+        node = derived.get(left)
+        if node is not None:
+            sources = node.referenced_columns
+            if not sources:
+                literals.append((right, pl.select(node.polars_expr).item()))
+                continue
+            if len(sources) != 1 or next(iter(sources)) not in frame.columns:
+                continue
+            dtype = frame.select(node.polars_expr).dtypes[0]
+            key = target[right]
+            if key.dtype != dtype:
+                if key.cast(dtype, strict=False).null_count() > key.null_count():
+                    target = target.with_columns(pl.int_range(1, target.height + 1).alias(right))
+                target = target.with_columns(pl.col(right).cast(dtype))
+            (left,) = sources
+        if left != table.subject_column and left in frame.columns:
+            pairs.append((left, right))
+
+    candidates: list[int] | range = range(target.height)
+    if literals:
+        matches = pl.all_horizontal(*(pl.col(right) == value for right, value in literals))
+        candidates = target.with_row_index("__row").filter(matches)["__row"].to_list()
+    if not pairs or not candidates:
+        return frame, target
 
     rng = random.Random(f"{options.seed}:joinkeys:{table.prefix}")
-    picks = [rng.randrange(target.height) for _ in range(frame.height)]
+    picks = [candidates[rng.randrange(len(candidates))] for _ in range(frame.height)]
     return frame.with_columns(
         *(target[right].gather(picks).alias(left) for left, right in pairs),
-    )
+    ), target
 
 
 def _materialize_pools(plan: DatasetPlan, options: GenerationOptions) -> dict[str, list]:
